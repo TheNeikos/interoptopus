@@ -1,5 +1,5 @@
 use darling::ToTokens;
-use syn::punctuated::Punctuated;
+use syn::visit_mut::VisitMut;
 use syn::{Attribute, Expr, GenericArgument, ItemImpl, Lit, Meta, PathArguments, Type, TypePath};
 
 /// From a let of attributes to an item, extracts the ones that are documentation, as strings.
@@ -27,52 +27,44 @@ pub fn extract_doc_lines(attributes: &[Attribute]) -> Vec<String> {
     docs
 }
 
+struct LifetimeRemover;
+
+impl syn::visit_mut::VisitMut for LifetimeRemover {
+    fn visit_path_segment_mut(&mut self, path_segment: &mut syn::PathSegment) {
+        match &mut path_segment.arguments {
+            PathArguments::None => {}
+            PathArguments::AngleBracketed(angled_args) => {
+                let punctuated = std::mem::take(&mut angled_args.args);
+                angled_args.args = punctuated
+                    .into_iter()
+                    .filter_map(|mut arg| match arg {
+                        GenericArgument::Lifetime(_) => None,
+                        _ => {
+                            self.visit_generic_argument_mut(&mut arg);
+                            Some(arg)
+                        }
+                    })
+                    .collect();
+
+                if angled_args.args.empty_or_trailing() {
+                    path_segment.arguments = PathArguments::None;
+                }
+            }
+            PathArguments::Parenthesized(_) => path_segment.arguments = PathArguments::None,
+        }
+    }
+
+    fn visit_type_reference_mut(&mut self, type_reference: &mut syn::TypeReference) {
+        type_reference.lifetime = None;
+        self.visit_type_mut(&mut type_reference.elem);
+    }
+}
+
 /// Ugly, incomplete function to purge `'a` from a `Generic<'a, T>`.
 pub fn purge_lifetimes_from_type(the_type: &Type) -> Type {
     let mut rval = the_type.clone();
 
-    match &mut rval {
-        Type::Path(x) => {
-            for p in &mut x.path.segments {
-                let mut still_has_parameter = false;
-
-                match &mut p.arguments {
-                    PathArguments::None => {}
-                    PathArguments::AngleBracketed(angled_args) => {
-                        let mut p = Punctuated::new();
-
-                        for generic_arg in &mut angled_args.args {
-                            match generic_arg {
-                                GenericArgument::Lifetime(_) => {}
-                                GenericArgument::Type(x) => {
-                                    let x = purge_lifetimes_from_type(x);
-                                    p.push(GenericArgument::Type(x));
-                                }
-                                GenericArgument::Constraint(x) => p.push(GenericArgument::Constraint(x.clone())),
-                                GenericArgument::Const(x) => p.push(GenericArgument::Const(x.clone())),
-                                _ => {}
-                            }
-                        }
-
-                        still_has_parameter = !p.is_empty();
-                        angled_args.args = p;
-                    }
-                    PathArguments::Parenthesized(_) => {}
-                }
-
-                if !still_has_parameter {
-                    p.arguments = PathArguments::None;
-                }
-            }
-        }
-        Type::Reference(x) => {
-            x.lifetime = None;
-            x.elem = Box::new(purge_lifetimes_from_type(&x.elem))
-        }
-        Type::Ptr(x) => x.elem = Box::new(purge_lifetimes_from_type(&x.elem)),
-        Type::Group(x) => x.elem = Box::new(purge_lifetimes_from_type(&x.elem)),
-        _ => {}
-    }
+    LifetimeRemover.visit_type_mut(&mut rval);
 
     rval
 }
